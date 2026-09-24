@@ -339,6 +339,7 @@ export async function runAgentLoop(
 
   let consecutiveErrors = 0;
   let running = true;
+  let lastInferenceTime = 0;
   let lastToolPatterns: string[] = [];
   let loopWarningPattern: string | null = null;
   let idleToolTurns = 0;
@@ -512,6 +513,16 @@ export async function runAgentLoop(
         isFirstRun,
       });
 
+      // Truncate system prompt for cloud APIs with tight token limits
+      // Groq free tier: 7000 input tokens. System prompt alone can be 5000+ chars.
+      const MAX_SYSTEM_PROMPT_CHARS = 4000;
+      let effectiveSystemPrompt = systemPrompt;
+      if (systemPrompt.length > MAX_SYSTEM_PROMPT_CHARS && config.groqApiKey) {
+        effectiveSystemPrompt = systemPrompt.slice(0, MAX_SYSTEM_PROMPT_CHARS) +
+          "\n\n[Truncated for cloud API token limits. Full prompt available in source.]";
+        log(config, `[PROMPT] Truncated system prompt from ${systemPrompt.length} to ${effectiveSystemPrompt.length} chars for cloud API`);
+      }
+
       // Phase 2.2: Pre-turn memory retrieval
       let memoryBlock: string | undefined;
       try {
@@ -527,7 +538,7 @@ export async function runAgentLoop(
       }
 
       let messages = buildContextMessages(
-        systemPrompt,
+        effectiveSystemPrompt,
         recentTurns,
         pendingInput,
       );
@@ -535,6 +546,17 @@ export async function runAgentLoop(
       // Inject memory block after system prompt, before conversation history
       if (memoryBlock) {
         messages.splice(1, 0, { role: "system", content: memoryBlock });
+      }
+
+      // Cloud APIs (e.g. Groq's qwen model) require at least one user message.
+      // On idle turns without pendingInput, inject a minimal user message so
+      // the model doesn't reject the request with "No user query found in messages."
+      const hasUserMessage = messages.some((m) => m.role === "user");
+      if (!hasUserMessage) {
+        messages.push({
+          role: "user",
+          content: "[system] Continue. No new input. Think step by step about your current task.",
+        });
       }
 
       if (orchestrator) {
@@ -595,11 +617,46 @@ export async function runAgentLoop(
       // Clear pending input after use
       pendingInput = undefined;
 
+      // Rate-limit cloud API calls to avoid 429s (Groq free tier: 7000 ITPM / 1000 OTPM)
+      if (config.groqApiKey) {
+        const elapsed = Date.now() - lastInferenceTime;
+        const minDelay = 10000; // 10 seconds between calls for Groq free tier
+        if (elapsed < minDelay) {
+          const wait = minDelay - elapsed;
+          log(config, `[RATELIMIT] Waiting ${wait}ms for Groq rate limit cooldown...`);
+          await new Promise((resolve) => setTimeout(resolve, wait));
+        }
+        lastInferenceTime = Date.now();
+      }
+
       // ── Inference Call (via router when available) ──
       const survivalTier = getSurvivalTier(financial.creditsCents);
       log(config, `[THINK] Routing inference (tier: ${survivalTier}, model: ${inference.getDefaultModel()})...`);
 
-      const inferenceTools = toolsToInferenceFormat(tools);
+      // Filter tools for local inference: small models on CPU can't handle 2700+ tool schemas
+      const OLLAMA_ESSENTIAL_TOOLS = new Set([
+        "exec", "read_file", "write_file", "list_files", "read_image",
+        "wget", "curl", "browser", "search", "deep_read",
+        "get_address", "get_balance", "get_token_balance", "transfer",
+        "get_transaction", "swap_exact_input", "approve",
+        "check_allowance", "x402_pay", "list_prices", "pay",
+        "list_invoices", "create_invoice", "get_invoice_status",
+        "mcp__memory__google_search", "mcp__memory__sequential_thinking",
+        "mcp__memory__insert_memory", "mcp__memory__search_memory",
+        "mcp__memory__get_entity", "mcp__memory__create_entity",
+        "mcp__memory__create_relation", "mcp__memory__search_graph",
+        "mcp__memory__open_nodes", "mcp__memory__search_nodes",
+        "mcp__memory__delete_entity", "mcp__memory__delete_relation",
+        "mcp__memory__delete_node", "mcp__memory__add_observations",
+        "mcp__memory__read_graph", "mcp__memory__get_relation",
+        "mcp__memory__validate_namespace", "mcp__memory__get_stats",
+      ]);
+      const isInferenceLocal = /ollama|localhost|127\.0\.0\.1/i.test(config.ollamaBaseUrl || "");
+      const allInferenceTools = toolsToInferenceFormat(tools);
+      const inferenceTools = isInferenceLocal
+        ? allInferenceTools.filter((t) => OLLAMA_ESSENTIAL_TOOLS.has(t.function.name))
+        : allInferenceTools;
+      log(config, `[THINK] Tools for inference: ${inferenceTools.length} of ${allInferenceTools.length}`);
       const routerResult = await inferenceRouter.route(
         {
           messages: messages,
@@ -608,6 +665,9 @@ export async function runAgentLoop(
           sessionId: db.getKV("session_id") || "default",
           turnId: ulid(),
           tools: inferenceTools,
+          // Pass maxTokens explicitly: the router otherwise falls back to the
+          // synthetic model entry's 4096, which busts Groq's 1000 OTPM limit.
+          maxTokens: config.maxTokensPerTurn,
         },
         (msgs, opts) => inference.chat(msgs, { ...opts, tools: inferenceTools }),
       );

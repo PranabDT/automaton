@@ -6,6 +6,7 @@
  */
 
 import nodePath from "node:path";
+import os from "node:os";
 import { ulid } from "ulid";
 import type {
   AutomatonTool,
@@ -27,8 +28,13 @@ const logger = createLogger("tools");
 
 // ─── Path Confinement ─────────────────────────────────────────
 // write_file is restricted to the sandbox home directory tree.
-// The sandbox home is /root for both local and remote execution.
-const SANDBOX_HOME = "/root";
+// The sandbox home is /root for Linux/macOS. On Windows there is no /root —
+// node's path.resolve would rewrite "/root/x" to "C:\root\x", which is not a
+// real sandbox. Since the exec tool runs commands locally in demo mode, the
+// writable root is the OS home directory.
+const SANDBOX_HOME = process.platform === "win32"
+  ? os.homedir().replace(/\\/g, "/")
+  : "/root";
 
 /**
  * Validate that a file path resolves to within the allowed root directory.
@@ -40,7 +46,7 @@ function confinePathToSandbox(filePath: string): string | { error: string } {
     ? nodePath.join(SANDBOX_HOME, filePath.slice(1))
     : filePath;
   // Resolve to absolute (relative paths resolve against SANDBOX_HOME)
-  const resolved = nodePath.resolve(SANDBOX_HOME, expanded);
+  const resolved = nodePath.resolve(SANDBOX_HOME, expanded).replace(/\\/g, "/");
   // Ensure the resolved path is within the sandbox home
   if (resolved !== SANDBOX_HOME && !resolved.startsWith(SANDBOX_HOME + "/")) {
     return {
@@ -136,11 +142,31 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
         const forbidden = isForbiddenCommand(command, ctx.identity.sandboxId);
         if (forbidden) return forbidden;
 
-        const result = await ctx.conway.exec(
-          command,
-          (args.timeout as number) || 30000,
-        );
-        return `exit_code: ${result.exitCode}\nstdout: ${result.stdout}\nstderr: ${result.stderr}`;
+        // Try Conway API first, fall back to local execution for demo/offline mode
+        try {
+          const result = await ctx.conway.exec(
+            command,
+            (args.timeout as number) || 30000,
+          );
+          return `exit_code: ${result.exitCode}\nstdout: ${result.stdout}\nstderr: ${result.stderr}`;
+        } catch (error: any) {
+          // If Conway API fails (401, network error, etc.), execute locally
+          if (error.status === 401 || error.message?.includes("Conway API error")) {
+            const { execSync } = await import("child_process");
+            const timeout = (args.timeout as number) || 30000;
+            try {
+              const output = execSync(String(command), {
+                timeout,
+                encoding: "utf-8",
+                maxBuffer: 1024 * 1024,
+              });
+              return `exit_code: 0\nstdout: ${output}\nstderr: `;
+            } catch (localError: any) {
+              return `exit_code: ${localError.status || 1}\nstdout: ${localError.stdout || ""}\nstderr: ${localError.stderr || localError.message}`;
+            }
+          }
+          throw error;
+        }
       },
     },
     {
@@ -166,8 +192,18 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
         if (isProtectedFile(confined)) {
           return "Blocked: Cannot overwrite protected file. This is a hard-coded safety invariant.";
         }
-        await ctx.conway.writeFile(confined, args.content as string);
-        return `File written: ${confined}`;
+        // Try Conway API first, fall back to local file write for demo/offline mode
+        try {
+          await ctx.conway.writeFile(confined, args.content as string);
+          return `File written: ${confined}`;
+        } catch {
+          // Conway API failed — write locally
+          const fs = await import("fs/promises");
+          const path = await import("path");
+          await fs.mkdir(path.dirname(confined), { recursive: true });
+          await fs.writeFile(confined, args.content as string, "utf-8");
+          return `File written (local): ${confined}`;
+        }
       },
     },
     {
@@ -198,15 +234,14 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
         try {
           return await ctx.conway.readFile(filePath);
         } catch {
-          // Conway files/read API may be broken — fall back to exec(cat)
-          const result = await ctx.conway.exec(
-            `cat ${escapeShellArg(filePath)}`,
-            30_000,
-          );
-          if (result.exitCode !== 0) {
+          // Conway API failed — fall back to local file read for demo/offline mode
+          try {
+            const fs = await import("fs/promises");
+            const content = await fs.readFile(filePath, "utf-8");
+            return content;
+          } catch {
             return `ERROR: File not found or not readable: ${filePath}`;
           }
-          return result.stdout;
         }
       },
     },

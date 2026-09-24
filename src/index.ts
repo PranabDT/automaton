@@ -293,6 +293,7 @@ async function run(): Promise<void> {
     openaiApiKey: config.openaiApiKey,
     anthropicApiKey: config.anthropicApiKey,
     ollamaBaseUrl,
+    groqApiKey: config.groqApiKey || process.env.GROQ_API_KEY,
     getModelProvider: (modelId) => modelRegistry.get(modelId)?.provider,
   });
 

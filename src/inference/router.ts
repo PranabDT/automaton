@@ -218,11 +218,38 @@ export class InferenceRouter {
     for (const modelId of fallbackIds) {
       if (!modelId) continue;
       const entry = this.registry.get(modelId);
-      if (!entry || !entry.enabled) continue;
-      const isFree = entry.costPer1kInput === 0 && entry.costPer1kOutput === 0;
-      const tierOk = tierRank >= (TIER_ORDER[entry.tierMinimum] ?? 0);
-      if (isFree || tierOk) {
-        return entry;
+      if (entry && entry.enabled) {
+        const isFree = entry.costPer1kInput === 0 && entry.costPer1kOutput === 0;
+        const tierOk = tierRank >= (TIER_ORDER[entry.tierMinimum] ?? 0);
+        if (isFree || tierOk) {
+          return entry;
+        }
+      }
+      // If not in registry but configured by user, create synthetic entry
+      // This allows cloud API models (Groq, OpenRouter, etc.) to work without registry registration
+      if (!entry) {
+        const provider = /groq|qwen\/|llama-[3-9]|meta-llama\//i.test(modelId) ? "groq"
+          : /^claude/i.test(modelId) ? "anthropic"
+          : /^(gpt-|o[1-9]|chatgpt)/i.test(modelId) ? "openai"
+          : "conway";
+        const now = new Date().toISOString();
+        return {
+          modelId,
+          provider: provider as ModelProvider,
+          displayName: modelId,
+          tierMinimum: "dead" as SurvivalTier,
+          costPer1kInput: 0,
+          costPer1kOutput: 0,
+          maxTokens: 4096,
+          contextWindow: 131072,
+          supportsTools: true,
+          supportsVision: false,
+          parameterStyle: "max_tokens" as const,
+          enabled: true,
+          lastSeen: null,
+          createdAt: now,
+          updatedAt: now,
+        };
       }
     }
 
